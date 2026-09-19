@@ -12,4 +12,3 @@ applications:
   disk_quota: 1024M
   env:
     NODE_ENV: production
-    PORT: 8080
