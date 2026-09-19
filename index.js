@@ -111,7 +111,6 @@ async function startBrowser() {
     browser = await puppeteer.launch({
       headless: 'new',
       pipe: true,
-      timeout: 60000,
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
@@ -162,10 +161,20 @@ async function startBrowser() {
       } else if (url.includes('/afk')) {
         stats.afkCount++;
         stats.lastEventTime = new Date().toISOString();
-        log(`💰 [AFK 结算] 触发金币结算 #${stats.afkCount} (HTTP ${status})`);
+        try {
+          const body = await response.text();
+          log(`💰 [AFK 结算] 触发金币结算 #${stats.afkCount} (HTTP ${status}): ${body.substring(0, 100)}`);
+        } catch(e) {
+          log(`💰 [AFK 结算] 触发金币结算 #${stats.afkCount} (HTTP ${status})`);
+        }
       } else if (url.includes('/balance')) {
         stats.balanceCount++;
-        log(`💳 [Balance] 刷新余额 #${stats.balanceCount} (HTTP ${status})`);
+        try {
+          const body = await response.text();
+          log(`💳 [Balance] 刷新余额 #${stats.balanceCount} (HTTP ${status}): ${body.substring(0, 100)}`);
+        } catch(e) {
+          log(`💳 [Balance] 刷新余额 #${stats.balanceCount} (HTTP ${status})`);
+        }
       }
     });
 
@@ -177,9 +186,10 @@ async function startBrowser() {
     });
 
     log('Navigating to https://dash.zenix.sg/dashboard/afk ...');
+    // 使用 domcontentloaded 代替 networkidle2，防止长轮询导致导航超时！
     await page.goto('https://dash.zenix.sg/dashboard/afk', {
-      waitUntil: 'networkidle2',
-      timeout: 60000
+      waitUntil: 'domcontentloaded',
+      timeout: 30000
     });
 
     pageTitle = await page.title();
