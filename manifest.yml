@@ -8,7 +8,7 @@ applications:
   routes:
     - route: zenix-afk-node.de.a9sapp.eu
   health-check-type: port
-  memory: 512M
+  memory: 768M
   disk_quota: 1024M
   env:
     NODE_ENV: production
