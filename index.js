@@ -1,7 +1,7 @@
 const express = require('express');
-const puppeteer = require('puppeteer-core');
+const puppeteer = require('puppeteer');
 const cookie = require('cookie');
-const fs = require('fs');
+const { execSync } = require('child_process');
 
 const app = express();
 const PORT = parseInt(process.env.PORT || '8080', 10);
@@ -30,26 +30,15 @@ function log(msg) {
   }
 }
 
-// 自动检测 Chromium 路径
-function findChromiumPath() {
-  const candidates = [
-    process.env.PUPPETEER_EXECUTABLE_PATH,
-    '/app/.apt/usr/bin/chromium',
-    '/app/.apt/usr/bin/chromium-browser',
-    '/usr/bin/chromium',
-    '/usr/bin/chromium-browser',
-    '/usr/lib/chromium/chromium'
-  ];
-
-  for (const c of candidates) {
-    if (c && fs.existsSync(c)) {
-      log(`Found Chromium executable at: ${c}`);
-      return c;
-    }
+// 确保 Chrome 二进制可用
+function ensureChrome() {
+  try {
+    log('Checking Puppeteer Chrome browser...');
+    execSync('npx puppeteer browsers install chrome', { stdio: 'inherit' });
+    log('Chrome check completed.');
+  } catch (e) {
+    log(`Chrome check warning: ${e.message}`);
   }
-
-  // fallback to default
-  return '/usr/bin/chromium';
 }
 
 // 1. Web 状态与探活接口
@@ -92,11 +81,10 @@ app.listen(PORT, () => {
 // 3. 启动无头浏览器并挂机
 async function startBrowser() {
   try {
-    const execPath = findChromiumPath();
-    log(`Launching Headless Chrome via: ${execPath}`);
+    ensureChrome();
 
+    log('Launching Headless Chrome via Puppeteer...');
     browser = await puppeteer.launch({
-      executablePath: execPath,
       headless: 'new',
       args: [
         '--no-sandbox',
