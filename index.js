@@ -2,6 +2,8 @@ const express = require('express');
 const puppeteer = require('puppeteer');
 const cookie = require('cookie');
 const { execSync } = require('child_process');
+const path = require('path');
+const fs = require('fs');
 
 const app = express();
 const PORT = parseInt(process.env.PORT || '8080', 10);
@@ -39,6 +41,23 @@ function cleanOldChrome() {
     execSync('pkill -9 -f chromium || true');
   } catch (e) {
     // ignore
+  }
+}
+
+// 确保 Chrome 浏览器就绪
+function ensureChromeInstalled() {
+  try {
+    const cacheDir = path.join(__dirname, '.cache', 'puppeteer');
+    if (!fs.existsSync(cacheDir) || fs.readdirSync(cacheDir).length === 0) {
+      log('Local Chrome cache not found, downloading now...');
+      execSync('npx puppeteer browsers install chrome', {
+        stdio: 'inherit',
+        env: { ...process.env, PUPPETEER_CACHE_DIR: cacheDir }
+      });
+      log('Chrome download completed.');
+    }
+  } catch (err) {
+    log(`Chrome check/install warning: ${err.message}`);
   }
 }
 
@@ -86,11 +105,12 @@ async function startBrowser() {
 
   try {
     cleanOldChrome();
+    ensureChromeInstalled();
 
     log('Launching Robust Headless Chrome via Puppeteer (pipe mode)...');
     browser = await puppeteer.launch({
       headless: 'new',
-      pipe: true, // 使用 pipe 避免 WS 端口超时
+      pipe: true,
       timeout: 60000,
       args: [
         '--no-sandbox',
