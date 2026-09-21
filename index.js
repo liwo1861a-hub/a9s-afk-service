@@ -32,11 +32,13 @@ let page = null;
 let pageTitle = 'Initializing';
 let pageUrl = 'about:blank';
 let isStarting = false;
+let isClosing = false;
 let currentSessionCookie = null;
 let lastLoginTime = null;
 let lastActivityTime = Date.now();
 let lastBalanceIncreaseTime = Date.now();
 let lastRecycleTime = Date.now();
+let lastRestartTime = Date.now();
 
 let stats = {
   probeCount: 0,
@@ -92,10 +94,10 @@ function ensureChromeInstalled() {
 app.get('/', (req, res) => {
   const memUsage = process.memoryUsage();
   res.json({
-    status: browser && page && !page.isClosed() ? 'running' : (isStarting ? 'starting' : 'recovering'),
+    status: browser && page && !page.isClosed() && !isStarting ? 'running' : (isStarting ? 'starting' : 'recovering'),
     platform: 'anynines PaaS (Cloud Foundry)',
     service: 'a9s-afk-service',
-    version: '1.3.0',
+    version: '1.3.1',
     uptime: `${Math.floor(process.uptime())}s`,
     currentUser: ZENIX_EMAIL,
     pageTitle,
@@ -116,7 +118,7 @@ app.get('/', (req, res) => {
   });
 });
 
-// 2. 实时画面截图预览（带 6 秒超时与假死防护）
+// 2. 实时画面截图预览（带 6 秒超时保护）
 app.get('/screenshot', async (req, res) => {
   try {
     if (page && !page.isClosed()) {
@@ -136,7 +138,7 @@ app.get('/screenshot', async (req, res) => {
 app.get('/restart', async (req, res) => {
   try {
     log('Manual restart requested via /restart');
-    triggerBrowserRestart('Manual restart via API');
+    triggerBrowserRestart('Manual restart via API', true);
     return res.json({ status: 'success', message: 'Restart triggered' });
   } catch (err) {
     res.status(500).json({ status: 'error', message: err.message });
@@ -149,7 +151,7 @@ app.get('/login-now', async (req, res) => {
     log('Manual login requested via /login-now');
     const ok = await performDirectLogin();
     if (ok) {
-      triggerBrowserRestart('Re-auth via /login-now');
+      triggerBrowserRestart('Re-auth via /login-now', true);
       return res.json({ status: 'success', message: 'Logged in, restarting browser session' });
     }
     return res.status(500).json({ status: 'failed', message: 'Login failed' });
@@ -166,7 +168,7 @@ app.listen(PORT, () => {
   log(`Web server listening on port ${PORT}`);
 });
 
-// 5. 双模认证机制：优先 Server Action 秒级登录，失败则 DOM 真实模拟登录
+// 5. 双模认证机制：优先 Server Action 秒级登录
 async function performDirectLogin() {
   log(`🔑 [Auth Stage 1] Direct Server-Action authentication for ${ZENIX_EMAIL}...`);
   
@@ -203,11 +205,11 @@ async function performDirectLogin() {
     }
   }
 
-  log('⚠️ Server-Action login did not succeed, fallback to DOM UI Login will be available if needed.');
+  log('⚠️ Server-Action login did not succeed, will try DOM fallback.');
   return null;
 }
 
-// 6. DOM UI 降级登录（应对 Server Action ID 改变或 CF 拦截场景）
+// 6. DOM UI 降级登录
 async function performDomUiLoginFallback() {
   if (!page || page.isClosed()) return false;
   try {
@@ -267,12 +269,13 @@ async function performDomUiLoginFallback() {
 async function startBrowser() {
   if (isStarting) return;
   isStarting = true;
+  isClosing = false;
+  lastRestartTime = Date.now();
 
   try {
     cleanOldChrome();
     ensureChromeInstalled();
 
-    // 优先通过 API 登录拿 Session
     const sessionVal = await performDirectLogin();
 
     log('Launching Headless Chrome (Optimized Low-Memory Mode)...');
@@ -351,45 +354,36 @@ async function startBrowser() {
       log('Injected session cookie into browser.');
     }
 
-    // 监听网络响应（含鉴权失效拦截与余额增长追踪）
+    // 监听网络响应（严格过滤 fetch/xhr，杜绝把 HTML 主文档当成 API 报错）
     page.on('response', async (response) => {
       const url = response.url();
       const status = response.status();
+      const reqType = response.request().resourceType();
 
-      // 1. 拦截静默失效：如果挂机接口返回 401/403/重定向到 login，说明 Session 已死，立刻触发重登
-      if (status === 401 || status === 403 || status === 307) {
-        if (url.includes('/afk') || url.includes('/dashboard')) {
-          log(`⚠️ Session invalidation intercepted on ${url} (HTTP ${status}). Scheduling refresh...`);
+      // 仅针对 fetch / xhr 请求进行错误校验
+      if (reqType === 'fetch' || reqType === 'xhr') {
+        if (status === 401 || status === 403) {
+          log(`⚠️ Session invalidation on ${url} (HTTP ${status}). Scheduling refresh...`);
           triggerBrowserRestart(`Session invalidation HTTP ${status}`);
           return;
         }
       }
 
-      // 2. 探针心跳
+      // 探针心跳
       if (url.includes('/api/ads/probe')) {
         stats.probeCount++;
         stats.lastEventTime = new Date().toISOString();
         lastActivityTime = Date.now();
         log(`📡 [Probe] 探针心跳 #${stats.probeCount} (HTTP ${status})`);
       } 
-      // 3. AFK 结算心跳
-      else if (url.includes('/afk') || url.includes('tickAfkCoinAction') || url.includes('startAfkAction')) {
+      // AFK 结算心跳
+      else if (url.includes('tickAfkCoinAction') || url.includes('startAfkAction')) {
         stats.afkCount++;
         stats.lastEventTime = new Date().toISOString();
         lastActivityTime = Date.now();
-        try {
-          const body = await response.text();
-          if (body.includes('No active AFK session') || body.includes('unauthorized') || body.includes('User not found')) {
-            log(`⚠️ AFK Error response: ${body.substring(0, 100)}, refreshing session...`);
-            triggerBrowserRestart('AFK session broken on server');
-            return;
-          }
-          log(`💰 [AFK 结算] 触发心跳 #${stats.afkCount} (HTTP ${status}): ${body.substring(0, 100)}`);
-        } catch (e) {
-          log(`💰 [AFK 结算] 触发心跳 #${stats.afkCount} (HTTP ${status})`);
-        }
+        log(`💰 [AFK 结算] 触发心跳 #${stats.afkCount} (HTTP ${status})`);
       } 
-      // 4. 余额刷新与增长检测（Stall Detection）
+      // 余额刷新与增长检测（Stall Detection）
       else if (url.includes('/balance')) {
         stats.balanceCount++;
         lastActivityTime = Date.now();
@@ -436,10 +430,12 @@ async function startBrowser() {
     lastBalanceIncreaseTime = Date.now();
     lastRecycleTime = Date.now();
 
-    // 监听断开
+    // 监听断开（仅在非主动关闭时触发）
     browser.on('disconnected', () => {
-      log('⚠️ Browser disconnected event received.');
-      triggerBrowserRestart('Browser disconnected');
+      if (!isClosing) {
+        log('⚠️ Browser disconnected unexpectedly.');
+        triggerBrowserRestart('Browser disconnected unexpected');
+      }
     });
 
   } catch (err) {
@@ -449,16 +445,31 @@ async function startBrowser() {
   }
 }
 
-// 8. 统一重启与轮换管理器
+// 8. 统一重启与轮换管理器（带冷却时间与断开监听清理）
 let restartTimer = null;
-function triggerBrowserRestart(reason) {
+function triggerBrowserRestart(reason, force = false) {
+  // 重启冷却保护：距离上次重启不足 30 秒时，忽略非强制重启请求，防止 Ping-Pong 循环
+  if (!force && Date.now() - lastRestartTime < 30000) {
+    log(`⏳ Restart ignored due to 30s cooldown (${reason})`);
+    return;
+  }
+
   if (restartTimer) return;
   log(`🔄 Scheduling browser restart. Reason: ${reason}`);
   stats.restartCount++;
+  lastRestartTime = Date.now();
   
   restartTimer = setTimeout(async () => {
     restartTimer = null;
     isStarting = false;
+    isClosing = true;
+
+    if (browser) {
+      try {
+        browser.removeAllListeners('disconnected');
+      } catch (e) {}
+    }
+
     if (page) {
       try { await page.close(); } catch (e) {}
       page = null;
@@ -467,6 +478,7 @@ function triggerBrowserRestart(reason) {
       try { await browser.close(); } catch (e) {}
       browser = null;
     }
+
     cleanOldChrome();
     log('♻️ Executing fresh browser startup...');
     startBrowser();
@@ -477,7 +489,7 @@ function triggerBrowserRestart(reason) {
 function startWatchdog() {
   setInterval(async () => {
     try {
-      if (isStarting) return;
+      if (isStarting || isClosing) return;
 
       // 1. 存在性检查
       if (!browser || !page || page.isClosed()) {
@@ -493,7 +505,7 @@ function startWatchdog() {
         pageUrl = page.url();
       } catch (e) {
         log(`🚨 [Watchdog Alert] Browser renderer is hanging (${e.message}), killing & restarting...`);
-        triggerBrowserRestart('Renderer hanging');
+        triggerBrowserRestart('Renderer hanging', true);
         return;
       }
 
@@ -508,14 +520,13 @@ function startWatchdog() {
       // 4. 重定向登录页自愈
       if (pageUrl.includes('/login')) {
         log('⚠️ Page on /login, session lost. Triggering restart & re-auth...');
-        triggerBrowserRestart('Landed on login page');
+        triggerBrowserRestart('Landed on login page', true);
         return;
       }
 
-      // 5. 精准弹窗清理与 Continue 恢复（绝不全局乱点）
+      // 5. 精准弹窗清理与 Continue 恢复
       try {
         await page.evaluate(() => {
-          // 恢复 Session Paused
           const pausedCards = Array.from(document.querySelectorAll('.ops-card'));
           for (const card of pausedCards) {
             if (card.innerText && card.innerText.includes('Session Paused')) {
@@ -523,7 +534,6 @@ function startWatchdog() {
               if (btn) btn.click();
             }
           }
-          // 关闭意外模态公告弹窗
           const closeBtns = Array.from(document.querySelectorAll('button[aria-label="Close"], button.close, [data-dismiss="modal"]'));
           for (const btn of closeBtns) {
             btn.click();
@@ -535,7 +545,7 @@ function startWatchdog() {
       const inactiveSec = Math.floor((Date.now() - lastActivityTime) / 1000);
       if (inactiveSec > 210) {
         log(`🚨 [Watchdog Alert] Network silent for ${inactiveSec}s, auto healing...`);
-        triggerBrowserRestart(`Network inactivity (${inactiveSec}s)`);
+        triggerBrowserRestart(`Network inactivity (${inactiveSec}s)`, true);
         return;
       }
 
@@ -545,7 +555,7 @@ function startWatchdog() {
         stats.stallCount++;
         log(`⚠️ [Stall Alert] No coin increase for ${coinStallSec}s (exceeded 720s). Triggering auto-reset #${stats.stallCount}...`);
         lastBalanceIncreaseTime = Date.now(); // reset timer
-        triggerBrowserRestart('Coin earnings stalled for >12min');
+        triggerBrowserRestart('Coin earnings stalled for >12min', true);
         return;
       }
 
@@ -555,7 +565,7 @@ function startWatchdog() {
         stats.recycleCount++;
         log(`🧹 [Scheduled Recycling] 6-hour memory recycle interval reached. Performing graceful browser refresh #${stats.recycleCount}...`);
         lastRecycleTime = Date.now();
-        triggerBrowserRestart('Scheduled 6-hour memory recycle');
+        triggerBrowserRestart('Scheduled 6-hour memory recycle', true);
       }
 
     } catch (err) {
