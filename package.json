@@ -1,6 +1,6 @@
 {
   "name": "a9s-afk-service",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Zenix AFK Service for anynines PaaS with Auto-Login and Session Refresh",
   "main": "index.js",
   "scripts": {

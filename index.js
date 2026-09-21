@@ -8,10 +8,9 @@ const fs = require('fs');
 const app = express();
 const PORT = parseInt(process.env.PORT || '8080', 10);
 
-// 账号密码与 Cookie 配置
-const ZENIX_EMAIL = process.env.ZENIX_EMAIL || 'luzi1861a@gmail.com';
-const ZENIX_PASSWORD = process.env.ZENIX_PASSWORD || 'LLHlys123...';
-const USER_COOKIE = process.env.ZENIX_COOKIE || 'session=a14673dd-da6e-437d-afb8-3f86e72a33ec; cf_clearance=y7hxCgnDQFhhKrNjZifU6y0oh1P9o5vcIXrzMCfS2UU-1789802055-1.2.1.1-I_tcS0WrUlu1DF_.9rlB2SuqLl7X.M3zZSInkP_mB45DStU42Wr943AGXxbiTsKTp8dOqs0EfirsbKVxa2HVhq9SYUUZsCq8RwQ6FckysMsrQ116GZxslZO10EaeK55InrAYWHK49eI_YaS8GhYakwcOsLWrmcsw126Dg9teW_ghevkjvL9qReroc.cO7bHm0TfgBn38sVyPmGp.rb3qEDIyy9mrvQGN9A4Aor25rX5fhb3RPpKAypTo0iT51EmwmEZh3HzsUXu9h.XIWC8WGQENskFJUbFUg.7oiybGMJrw_P03QYeYMFxPeEA6cU5Bpvsp2KS5NdR4tVwLi5fRBAmBiXyXaKOmFk9zRfXufdSvrfOpiz7Crj8qUwguG31_FCeKYEFeauRjpW79vKMTYg';
+// 账号密码配置
+const ZENIX_EMAIL = process.env.ZENIX_EMAIL || 'liwoniu0@gmail.com';
+const ZENIX_PASSWORD = process.env.ZENIX_PASSWORD || 'Wkps0h_0FrP5n7RXoO4IPh0CaA1!';
 const USER_AGENT = process.env.USER_AGENT || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36';
 
 let browser = null;
@@ -20,6 +19,7 @@ let pageTitle = 'Initializing';
 let pageUrl = 'about:blank';
 let isStarting = false;
 let currentSessionCookie = null;
+let currentUser = null;
 let lastLoginTime = null;
 
 let stats = {
@@ -74,8 +74,9 @@ app.get('/', (req, res) => {
     status: browser && page ? 'running' : (isStarting ? 'starting' : 'recovering'),
     platform: 'anynines PaaS (Cloud Foundry)',
     service: 'a9s-afk-service',
-    version: '1.2.0',
+    version: '1.2.1',
     uptime: `${Math.floor(process.uptime())}s`,
+    currentUser: currentUser || ZENIX_EMAIL,
     pageTitle,
     pageUrl,
     currentSession: currentSessionCookie ? `${currentSessionCookie.substring(0, 8)}...` : 'None',
@@ -127,19 +128,18 @@ app.listen(PORT, () => {
 async function executeLoginFlow() {
   if (!page || page.isClosed()) return false;
   try {
-    log('🔑 Initiating automated login flow...');
+    log(`🔑 Initiating automated login flow for ${ZENIX_EMAIL}...`);
+    
+    // 清除旧 cookies 确保干净登录目标账号
+    const client = await page.target().createCDPSession();
+    await client.send('Network.clearBrowserCookies');
+
     await page.goto('https://dash.zenix.sg/login', {
       waitUntil: 'domcontentloaded',
       timeout: 45000
     });
 
     await new Promise(r => setTimeout(r, 2000));
-
-    // 检测是否已被直接重定向至 dashboard（代表已有有效会话）
-    if (page.url().includes('/dashboard') && !page.url().includes('/login')) {
-      log('✅ Already logged in, skipping credential submission.');
-      return true;
-    }
 
     // 等待邮箱和密码输入框就绪
     await page.waitForSelector('#email', { timeout: 15000 });
@@ -267,26 +267,6 @@ async function startBrowser() {
       });
     });
 
-    // 初始尝试注入已有 Cookie
-    if (USER_COOKIE) {
-      try {
-        const parsedCookies = cookie.parse(USER_COOKIE);
-        const cookiesToSet = Object.entries(parsedCookies).map(([name, value]) => ({
-          name,
-          value,
-          domain: '.zenix.sg',
-          path: '/'
-        }));
-        await page.setCookie(...cookiesToSet);
-        if (parsedCookies.session) {
-          currentSessionCookie = parsedCookies.session;
-        }
-        log(`Injected ${cookiesToSet.length} initial cookies into .zenix.sg domain.`);
-      } catch (e) {
-        log(`Initial cookie injection note: ${e.message}`);
-      }
-    }
-
     // 监听网络请求和响应
     page.on('response', async (response) => {
       const url = response.url();
@@ -327,22 +307,8 @@ async function startBrowser() {
       }
     });
 
-    log('Navigating to https://dash.zenix.sg/dashboard/afk ...');
-    await page.goto('https://dash.zenix.sg/dashboard/afk', {
-      waitUntil: 'domcontentloaded',
-      timeout: 45000
-    });
-
-    pageTitle = await page.title();
-    pageUrl = page.url();
-
-    // 如果被重定向到 /login 说明 Session 失效，自动执行登录
-    if (pageUrl.includes('/login')) {
-      log('⚠️ Initial session expired or missing, triggering auto-login...');
-      await executeLoginFlow();
-    } else {
-      log(`✅ Page loaded! Title: "${pageTitle}" | URL: ${pageUrl}`);
-    }
+    // 启动即直接执行全自动登录流程
+    await executeLoginFlow();
 
     isStarting = false;
 
