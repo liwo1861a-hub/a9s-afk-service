@@ -8,20 +8,27 @@ const fs = require('fs');
 const app = express();
 const PORT = parseInt(process.env.PORT || '8080', 10);
 
+// 账号密码与 Cookie 配置
+const ZENIX_EMAIL = process.env.ZENIX_EMAIL || 'luzi1861a@gmail.com';
+const ZENIX_PASSWORD = process.env.ZENIX_PASSWORD || 'LLHlys123...';
 const USER_COOKIE = process.env.ZENIX_COOKIE || 'session=a14673dd-da6e-437d-afb8-3f86e72a33ec; cf_clearance=y7hxCgnDQFhhKrNjZifU6y0oh1P9o5vcIXrzMCfS2UU-1789802055-1.2.1.1-I_tcS0WrUlu1DF_.9rlB2SuqLl7X.M3zZSInkP_mB45DStU42Wr943AGXxbiTsKTp8dOqs0EfirsbKVxa2HVhq9SYUUZsCq8RwQ6FckysMsrQ116GZxslZO10EaeK55InrAYWHK49eI_YaS8GhYakwcOsLWrmcsw126Dg9teW_ghevkjvL9qReroc.cO7bHm0TfgBn38sVyPmGp.rb3qEDIyy9mrvQGN9A4Aor25rX5fhb3RPpKAypTo0iT51EmwmEZh3HzsUXu9h.XIWC8WGQENskFJUbFUg.7oiybGMJrw_P03QYeYMFxPeEA6cU5Bpvsp2KS5NdR4tVwLi5fRBAmBiXyXaKOmFk9zRfXufdSvrfOpiz7Crj8qUwguG31_FCeKYEFeauRjpW79vKMTYg';
-const USER_AGENT = process.env.USER_AGENT || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36 Edg/153.0.0.0';
+const USER_AGENT = process.env.USER_AGENT || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36';
 
 let browser = null;
 let page = null;
 let pageTitle = 'Initializing';
-let pageUrl = 'About:blank';
+let pageUrl = 'about:blank';
 let isStarting = false;
+let currentSessionCookie = null;
+let lastLoginTime = null;
 
 let stats = {
   probeCount: 0,
   afkCount: 0,
   balanceCount: 0,
+  currentCoins: 0,
   lastEventTime: null,
+  loginCount: 0,
   recentLogs: []
 };
 
@@ -29,12 +36,12 @@ function log(msg) {
   const line = `[${new Date().toLocaleTimeString()}] ${msg}`;
   console.log(line);
   stats.recentLogs.push(line);
-  if (stats.recentLogs.length > 30) {
+  if (stats.recentLogs.length > 40) {
     stats.recentLogs.shift();
   }
 }
 
-// 杀掉潜在残留的孤儿 Chrome 进程
+// 杀掉潜在残留的 Chrome 进程
 function cleanOldChrome() {
   try {
     execSync('pkill -9 -f chrome || true');
@@ -67,11 +74,15 @@ app.get('/', (req, res) => {
     status: browser && page ? 'running' : (isStarting ? 'starting' : 'recovering'),
     platform: 'anynines PaaS (Cloud Foundry)',
     service: 'a9s-afk-service',
+    version: '1.2.0',
     uptime: `${Math.floor(process.uptime())}s`,
     pageTitle,
     pageUrl,
+    currentSession: currentSessionCookie ? `${currentSessionCookie.substring(0, 8)}...` : 'None',
+    lastLoginTime,
     stats,
     viewLiveScreenshot: '/screenshot',
+    forceLoginNow: '/login-now',
     timestamp: new Date().toISOString()
   });
 });
@@ -90,6 +101,20 @@ app.get('/screenshot', async (req, res) => {
   }
 });
 
+// 3. 手动触发重新登录
+app.get('/login-now', async (req, res) => {
+  try {
+    if (page && !page.isClosed()) {
+      log('Manual login requested via /login-now');
+      await executeLoginFlow();
+      return res.json({ status: 'success', message: 'Login flow executed', pageUrl: page.url() });
+    }
+    res.status(503).json({ status: 'error', message: 'Page not ready' });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
 app.get('/health', (req, res) => {
   res.status(200).send('OK');
 });
@@ -98,7 +123,78 @@ app.listen(PORT, () => {
   log(`Web server listening on port ${PORT}`);
 });
 
-// 3. 启动无头浏览器并挂机
+// 4. 执行自动登录流程
+async function executeLoginFlow() {
+  if (!page || page.isClosed()) return false;
+  try {
+    log('🔑 Initiating automated login flow...');
+    await page.goto('https://dash.zenix.sg/login', {
+      waitUntil: 'domcontentloaded',
+      timeout: 45000
+    });
+
+    await new Promise(r => setTimeout(r, 2000));
+
+    // 检测是否已被直接重定向至 dashboard（代表已有有效会话）
+    if (page.url().includes('/dashboard') && !page.url().includes('/login')) {
+      log('✅ Already logged in, skipping credential submission.');
+      return true;
+    }
+
+    // 等待邮箱和密码输入框就绪
+    await page.waitForSelector('#email', { timeout: 15000 });
+    await page.waitForSelector('#password', { timeout: 15000 });
+
+    log(`Filling login credentials for ${ZENIX_EMAIL}...`);
+    await page.click('#email', { clickCount: 3 });
+    await page.type('#email', ZENIX_EMAIL, { delay: 40 });
+
+    await page.click('#password', { clickCount: 3 });
+    await page.type('#password', ZENIX_PASSWORD, { delay: 40 });
+
+    await new Promise(r => setTimeout(r, 500));
+
+    log('Submitting login form...');
+    await Promise.all([
+      page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30000 }).catch(e => {
+        log(`Navigation note: ${e.message}`);
+      }),
+      page.click('button[type="submit"]')
+    ]);
+
+    await new Promise(r => setTimeout(r, 3000));
+
+    const currentUrl = page.url();
+    log(`Login submitted. Landed on: ${currentUrl}`);
+
+    // 获取并保存最新 Session Cookie
+    const cookies = await page.cookies();
+    const sessionCookie = cookies.find(c => c.name === 'session');
+    if (sessionCookie) {
+      currentSessionCookie = sessionCookie.value;
+      lastLoginTime = new Date().toISOString();
+      stats.loginCount++;
+      log(`🎉 New session captured: ${currentSessionCookie.substring(0, 10)}... (Login #${stats.loginCount})`);
+    }
+
+    // 跳转至 AFK 挂机页
+    log('Navigating to AFK rewards dashboard...');
+    await page.goto('https://dash.zenix.sg/dashboard/afk', {
+      waitUntil: 'domcontentloaded',
+      timeout: 45000
+    });
+
+    pageTitle = await page.title();
+    pageUrl = page.url();
+    log(`✅ AFK page ready! Title: "${pageTitle}" | URL: ${pageUrl}`);
+    return true;
+  } catch (err) {
+    log(`❌ Login flow error: ${err.message}`);
+    return false;
+  }
+}
+
+// 5. 启动无头浏览器并挂机
 async function startBrowser() {
   if (isStarting) return;
   isStarting = true;
@@ -131,23 +227,65 @@ async function startBrowser() {
     page = await browser.newPage();
     await page.setUserAgent(USER_AGENT);
 
-    // 注入页面防休眠 / 防切后台机制
+    // 注入页面防休眠 / 防切后台 / 广告探测穿透机制
     await page.evaluateOnNewDocument(() => {
+      // 1. 防休眠与活跃状态伪装
       Object.defineProperty(document, 'hidden', { get: () => false });
       Object.defineProperty(document, 'visibilityState', { get: () => 'visible' });
       window.addEventListener('visibilitychange', (e) => e.stopImmediatePropagation(), true);
+
+      // 2. 绕过广告探测 DOM 测量（确保 ad-probe 判定为存在并渲染）
+      const origGetComputedStyle = window.getComputedStyle;
+      window.getComputedStyle = function (el, pseudo) {
+        const style = origGetComputedStyle.call(window, el, pseudo);
+        if (el && el.id === 'ad-probe') {
+          return new Proxy(style, {
+            get(target, prop) {
+              if (prop === 'display') return 'block';
+              if (prop === 'visibility') return 'visible';
+              return target[prop];
+            }
+          });
+        }
+        return style;
+      };
+
+      const origOffsetHeight = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'offsetHeight');
+      Object.defineProperty(HTMLElement.prototype, 'offsetHeight', {
+        get() {
+          if (this.id === 'ad-probe') return 1;
+          return origOffsetHeight ? origOffsetHeight.get.call(this) : 1;
+        }
+      });
+
+      const origClientHeight = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'clientHeight');
+      Object.defineProperty(HTMLElement.prototype, 'clientHeight', {
+        get() {
+          if (this.id === 'ad-probe') return 1;
+          return origClientHeight ? origClientHeight.get.call(this) : 1;
+        }
+      });
     });
 
-    // 解析并注入 Cookie
-    const parsedCookies = cookie.parse(USER_COOKIE);
-    const cookiesToSet = Object.entries(parsedCookies).map(([name, value]) => ({
-      name,
-      value,
-      domain: '.zenix.sg',
-      path: '/'
-    }));
-    await page.setCookie(...cookiesToSet);
-    log(`Injected ${cookiesToSet.length} cookies into .zenix.sg domain.`);
+    // 初始尝试注入已有 Cookie
+    if (USER_COOKIE) {
+      try {
+        const parsedCookies = cookie.parse(USER_COOKIE);
+        const cookiesToSet = Object.entries(parsedCookies).map(([name, value]) => ({
+          name,
+          value,
+          domain: '.zenix.sg',
+          path: '/'
+        }));
+        await page.setCookie(...cookiesToSet);
+        if (parsedCookies.session) {
+          currentSessionCookie = parsedCookies.session;
+        }
+        log(`Injected ${cookiesToSet.length} initial cookies into .zenix.sg domain.`);
+      } catch (e) {
+        log(`Initial cookie injection note: ${e.message}`);
+      }
+    }
 
     // 监听网络请求和响应
     page.on('response', async (response) => {
@@ -158,13 +296,13 @@ async function startBrowser() {
         stats.probeCount++;
         stats.lastEventTime = new Date().toISOString();
         log(`📡 [Probe] 探针心跳 #${stats.probeCount} (HTTP ${status})`);
-      } else if (url.includes('/afk')) {
+      } else if (url.includes('/afk') || url.includes('tickAfkCoinAction')) {
         stats.afkCount++;
         stats.lastEventTime = new Date().toISOString();
         try {
           const body = await response.text();
-          log(`💰 [AFK 结算] 触发金币结算 #${stats.afkCount} (HTTP ${status}): ${body.substring(0, 100)}`);
-        } catch(e) {
+          log(`💰 [AFK 结算] 触发金币结算 #${stats.afkCount} (HTTP ${status}): ${body.substring(0, 120)}`);
+        } catch (e) {
           log(`💰 [AFK 结算] 触发金币结算 #${stats.afkCount} (HTTP ${status})`);
         }
       } else if (url.includes('/balance')) {
@@ -172,7 +310,11 @@ async function startBrowser() {
         try {
           const body = await response.text();
           log(`💳 [Balance] 刷新余额 #${stats.balanceCount} (HTTP ${status}): ${body.substring(0, 100)}`);
-        } catch(e) {
+          const match = body.match(/"coins":\s*([0-9.]+)/);
+          if (match) {
+            stats.currentCoins = parseFloat(match[1]);
+          }
+        } catch (e) {
           log(`💳 [Balance] 刷新余额 #${stats.balanceCount} (HTTP ${status})`);
         }
       }
@@ -180,21 +322,28 @@ async function startBrowser() {
 
     page.on('console', (msg) => {
       const text = msg.text();
-      if (text.toLowerCase().includes('coin') || text.toLowerCase().includes('afk') || text.toLowerCase().includes('balance') || text.toLowerCase().includes('reward')) {
+      if (text.toLowerCase().includes('coin') || text.toLowerCase().includes('afk') || text.toLowerCase().includes('reward') || text.toLowerCase().includes('session')) {
         log(`[Page Console] ${text}`);
       }
     });
 
     log('Navigating to https://dash.zenix.sg/dashboard/afk ...');
-    // 使用 domcontentloaded 代替 networkidle2，防止长轮询导致导航超时！
     await page.goto('https://dash.zenix.sg/dashboard/afk', {
       waitUntil: 'domcontentloaded',
-      timeout: 30000
+      timeout: 45000
     });
 
     pageTitle = await page.title();
     pageUrl = page.url();
-    log(`✅ Page loaded! Title: "${pageTitle}" | URL: ${pageUrl}`);
+
+    // 如果被重定向到 /login 说明 Session 失效，自动执行登录
+    if (pageUrl.includes('/login')) {
+      log('⚠️ Initial session expired or missing, triggering auto-login...');
+      await executeLoginFlow();
+    } else {
+      log(`✅ Page loaded! Title: "${pageTitle}" | URL: ${pageUrl}`);
+    }
+
     isStarting = false;
 
     // 监听浏览器异常断开，自愈重连
@@ -206,16 +355,66 @@ async function startBrowser() {
       setTimeout(startBrowser, 5000);
     });
 
+    // 启动常驻巡检守护循环（每 20 秒一次）
+    startGuardianLoop();
+
   } catch (err) {
     log(`❌ Browser error: ${err.message}`);
     isStarting = false;
     if (browser) {
-      try { await browser.close(); } catch(e){}
+      try { await browser.close(); } catch (e) { }
       browser = null;
       page = null;
     }
     setTimeout(startBrowser, 10000);
   }
+}
+
+// 6. 常驻巡检守护循环（自动点击恢复按钮、检测会话失效、防卡死）
+function startGuardianLoop() {
+  setInterval(async () => {
+    try {
+      if (!page || page.isClosed()) return;
+
+      pageTitle = await page.title();
+      pageUrl = page.url();
+
+      // 1. 如果掉到登录页，自动登录
+      if (pageUrl.includes('/login')) {
+        log('⚠️ Session expired (page on /login). Auto logging in...');
+        await executeLoginFlow();
+        return;
+      }
+
+      // 2. 如果不在 AFK 页面，自动跳转回去
+      if (!pageUrl.includes('/dashboard/afk')) {
+        log(`⚠️ Not on AFK page (currently ${pageUrl}), redirecting to /dashboard/afk...`);
+        await page.goto('https://dash.zenix.sg/dashboard/afk', { waitUntil: 'domcontentloaded', timeout: 30000 });
+        return;
+      }
+
+      // 3. 自动查找并点击页面上的 "Continue"、"Start"、"Check Again"、"Retry" 按钮
+      const clicked = await page.evaluate(() => {
+        let actionDone = false;
+        const buttons = Array.from(document.querySelectorAll('button'));
+        for (const btn of buttons) {
+          const text = (btn.innerText || '').trim().toLowerCase();
+          if (text.includes('continue') || text.includes('check again') || text.includes('resume') || text.includes('retry') || text.includes('start')) {
+            btn.click();
+            actionDone = true;
+          }
+        }
+        return actionDone;
+      });
+
+      if (clicked) {
+        log('🔘 Auto-clicked resume/continue/retry button on page.');
+      }
+
+    } catch (e) {
+      log(`[Guardian Note] ${e.message}`);
+    }
+  }, 20 * 1000);
 }
 
 // 延迟 2 秒启动
