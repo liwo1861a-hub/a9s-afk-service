@@ -23,9 +23,14 @@ jobs:
           sudo apt-get install -y cf8-cli
 
       - name: Login & Target anynines Space
+        env:
+          CF_DIAL_TIMEOUT: 60
         run: |
           cf login -a https://api.de.a9s.eu -u "${{ secrets.A9S_USERNAME || 'liwo1861a@gmail.com' }}" -p "${{ secrets.A9S_PASSWORD || 'LLHlys123...' }}" -o liwo1861a_gmail_com -s production
 
       - name: Deploy AFK Keep-Alive Service
+        env:
+          CF_DIAL_TIMEOUT: 60
         run: |
-          cf push
+          echo "Pushing application to anynines..."
+          cf push || (echo "Retrying cf push after 15s..." && sleep 15 && cf push)
