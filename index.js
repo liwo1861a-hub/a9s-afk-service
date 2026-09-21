@@ -8,9 +8,15 @@ const fs = require('fs');
 const app = express();
 const PORT = parseInt(process.env.PORT || '8080', 10);
 
-// 账号密码配置
+// 账号密码候选池（自动按序尝试，直到成功）
 const ZENIX_EMAIL = process.env.ZENIX_EMAIL || 'liwoniu0@gmail.com';
-const ZENIX_PASSWORD = process.env.ZENIX_PASSWORD || 'Wkps0h_0FrP5n7RXoO4IPh0CaA1!';
+const PASSWORDS = [
+  process.env.ZENIX_PASSWORD,
+  'Wkps0h_0FrP5n7RXoO4IPh0CaA1!',
+  'LLHlys123...',
+  'LLHLYS123...'
+].filter(Boolean);
+
 const USER_AGENT = process.env.USER_AGENT || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36';
 
 let browser = null;
@@ -19,7 +25,6 @@ let pageTitle = 'Initializing';
 let pageUrl = 'about:blank';
 let isStarting = false;
 let currentSessionCookie = null;
-let currentUser = null;
 let lastLoginTime = null;
 
 let stats = {
@@ -76,7 +81,7 @@ app.get('/', (req, res) => {
     service: 'a9s-afk-service',
     version: '1.2.1',
     uptime: `${Math.floor(process.uptime())}s`,
-    currentUser: currentUser || ZENIX_EMAIL,
+    currentUser: ZENIX_EMAIL,
     pageTitle,
     pageUrl,
     currentSession: currentSessionCookie ? `${currentSessionCookie.substring(0, 8)}...` : 'None',
@@ -105,12 +110,9 @@ app.get('/screenshot', async (req, res) => {
 // 3. 手动触发重新登录
 app.get('/login-now', async (req, res) => {
   try {
-    if (page && !page.isClosed()) {
-      log('Manual login requested via /login-now');
-      await executeLoginFlow();
-      return res.json({ status: 'success', message: 'Login flow executed', pageUrl: page.url() });
-    }
-    res.status(503).json({ status: 'error', message: 'Page not ready' });
+    log('Manual login requested via /login-now');
+    const ok = await performDirectLoginAndInject();
+    return res.json({ status: ok ? 'success' : 'failed', currentSession: currentSessionCookie ? `${currentSessionCookie.substring(0, 8)}...` : 'None', pageUrl: page ? page.url() : 'null' });
   } catch (err) {
     res.status(500).json({ status: 'error', message: err.message });
   }
@@ -124,74 +126,64 @@ app.listen(PORT, () => {
   log(`Web server listening on port ${PORT}`);
 });
 
-// 4. 执行自动登录流程
-async function executeLoginFlow() {
-  if (!page || page.isClosed()) return false;
-  try {
-    log(`🔑 Initiating automated login flow for ${ZENIX_EMAIL}...`);
-    
-    // 清除旧 cookies 确保干净登录目标账号
-    const client = await page.target().createCDPSession();
-    await client.send('Network.clearBrowserCookies');
+// 4. 通过 Next.js Server Action 秒级执行登录并提取 Session
+async function performDirectLoginAndInject() {
+  log(`🔑 Initiating direct login for ${ZENIX_EMAIL}...`);
+  
+  for (const pwd of PASSWORDS) {
+    try {
+      const resp = await fetch('https://dash.zenix.sg/login', {
+        method: 'POST',
+        headers: {
+          'Next-Action': '6013174bf5bcaa2ea2f3f0417e1f6e0370071e5036',
+          'Content-Type': 'text/plain;charset=UTF-8',
+          'User-Agent': USER_AGENT,
+          'Origin': 'https://dash.zenix.sg',
+          'Referer': 'https://dash.zenix.sg/login'
+        },
+        body: JSON.stringify([ZENIX_EMAIL, pwd])
+      });
 
-    await page.goto('https://dash.zenix.sg/login', {
-      waitUntil: 'domcontentloaded',
-      timeout: 45000
-    });
+      const bodyText = await resp.text();
+      const setCookie = resp.headers.get('set-cookie');
 
-    await new Promise(r => setTimeout(r, 2000));
+      if (bodyText.includes('"success":true') && setCookie) {
+        const match = setCookie.match(/session=([^;]+)/);
+        if (match) {
+          currentSessionCookie = match[1];
+          lastLoginTime = new Date().toISOString();
+          stats.loginCount++;
+          log(`🎉 Login successful! New session captured: ${currentSessionCookie.substring(0, 10)}... (Login #${stats.loginCount})`);
 
-    // 等待邮箱和密码输入框就绪
-    await page.waitForSelector('#email', { timeout: 15000 });
-    await page.waitForSelector('#password', { timeout: 15000 });
-
-    log(`Filling login credentials for ${ZENIX_EMAIL}...`);
-    await page.click('#email', { clickCount: 3 });
-    await page.type('#email', ZENIX_EMAIL, { delay: 40 });
-
-    await page.click('#password', { clickCount: 3 });
-    await page.type('#password', ZENIX_PASSWORD, { delay: 40 });
-
-    await new Promise(r => setTimeout(r, 500));
-
-    log('Submitting login form...');
-    await Promise.all([
-      page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30000 }).catch(e => {
-        log(`Navigation note: ${e.message}`);
-      }),
-      page.click('button[type="submit"]')
-    ]);
-
-    await new Promise(r => setTimeout(r, 3000));
-
-    const currentUrl = page.url();
-    log(`Login submitted. Landed on: ${currentUrl}`);
-
-    // 获取并保存最新 Session Cookie
-    const cookies = await page.cookies();
-    const sessionCookie = cookies.find(c => c.name === 'session');
-    if (sessionCookie) {
-      currentSessionCookie = sessionCookie.value;
-      lastLoginTime = new Date().toISOString();
-      stats.loginCount++;
-      log(`🎉 New session captured: ${currentSessionCookie.substring(0, 10)}... (Login #${stats.loginCount})`);
+          // 注入到 Puppeteer 页面中并打开 AFK
+          if (page && !page.isClosed()) {
+            await page.setCookie({
+              name: 'session',
+              value: currentSessionCookie,
+              domain: '.zenix.sg',
+              path: '/'
+            });
+            log('Navigating page to /dashboard/afk with refreshed session...');
+            await page.goto('https://dash.zenix.sg/dashboard/afk', {
+              waitUntil: 'domcontentloaded',
+              timeout: 45000
+            });
+            pageTitle = await page.title();
+            pageUrl = page.url();
+            log(`✅ AFK page ready! Title: "${pageTitle}" | URL: ${pageUrl}`);
+          }
+          return true;
+        }
+      } else {
+        log(`Password trial failed (${pwd.substring(0, 3)}***): ${bodyText.substring(0, 100)}`);
+      }
+    } catch (e) {
+      log(`Login attempt error: ${e.message}`);
     }
-
-    // 跳转至 AFK 挂机页
-    log('Navigating to AFK rewards dashboard...');
-    await page.goto('https://dash.zenix.sg/dashboard/afk', {
-      waitUntil: 'domcontentloaded',
-      timeout: 45000
-    });
-
-    pageTitle = await page.title();
-    pageUrl = page.url();
-    log(`✅ AFK page ready! Title: "${pageTitle}" | URL: ${pageUrl}`);
-    return true;
-  } catch (err) {
-    log(`❌ Login flow error: ${err.message}`);
-    return false;
   }
+
+  log('❌ All password candidates failed to authenticate.');
+  return false;
 }
 
 // 5. 启动无头浏览器并挂机
@@ -307,8 +299,8 @@ async function startBrowser() {
       }
     });
 
-    // 启动即直接执行全自动登录流程
-    await executeLoginFlow();
+    // 启动即直接执行全自动秒级登录并跳转挂机
+    await performDirectLoginAndInject();
 
     isStarting = false;
 
@@ -345,10 +337,10 @@ function startGuardianLoop() {
       pageTitle = await page.title();
       pageUrl = page.url();
 
-      // 1. 如果掉到登录页，自动登录
+      // 1. 如果掉到登录页或 Session 丢失，自动重新登录
       if (pageUrl.includes('/login')) {
-        log('⚠️ Session expired (page on /login). Auto logging in...');
-        await executeLoginFlow();
+        log('⚠️ Session expired (page on /login). Performing auto-login...');
+        await performDirectLoginAndInject();
         return;
       }
 
