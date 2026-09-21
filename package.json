@@ -1,7 +1,7 @@
 {
   "name": "a9s-afk-service",
-  "version": "1.2.2",
-  "description": "Zenix AFK Service for anynines PaaS with Robust Watchdog and Precise DOM Guardian",
+  "version": "1.3.0",
+  "description": "Enterprise Resilient Zenix AFK Service for anynines PaaS with Dual-Auth Fallback, Memory Leak Protection, Stall Watchdog and Crash Defense",
   "main": "index.js",
   "scripts": {
     "postinstall": "npx puppeteer browsers install chrome",
