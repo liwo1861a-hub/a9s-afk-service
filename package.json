@@ -1,7 +1,7 @@
 {
   "name": "a9s-afk-service",
-  "version": "1.2.1",
-  "description": "Zenix AFK Service for anynines PaaS with Auto-Login and Session Refresh",
+  "version": "1.2.2",
+  "description": "Zenix AFK Service for anynines PaaS with Robust Watchdog and Precise DOM Guardian",
   "main": "index.js",
   "scripts": {
     "postinstall": "npx puppeteer browsers install chrome",

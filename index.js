@@ -8,7 +8,7 @@ const fs = require('fs');
 const app = express();
 const PORT = parseInt(process.env.PORT || '8080', 10);
 
-// 账号密码候选池（自动按序尝试，直到成功）
+// 账号密码候选池
 const ZENIX_EMAIL = process.env.ZENIX_EMAIL || 'liwoniu0@gmail.com';
 const PASSWORDS = [
   process.env.ZENIX_PASSWORD,
@@ -26,6 +26,7 @@ let pageUrl = 'about:blank';
 let isStarting = false;
 let currentSessionCookie = null;
 let lastLoginTime = null;
+let lastActivityTime = Date.now();
 
 let stats = {
   probeCount: 0,
@@ -34,6 +35,7 @@ let stats = {
   currentCoins: 0,
   lastEventTime: null,
   loginCount: 0,
+  restartCount: 0,
   recentLogs: []
 };
 
@@ -41,12 +43,12 @@ function log(msg) {
   const line = `[${new Date().toLocaleTimeString()}] ${msg}`;
   console.log(line);
   stats.recentLogs.push(line);
-  if (stats.recentLogs.length > 40) {
+  if (stats.recentLogs.length > 50) {
     stats.recentLogs.shift();
   }
 }
 
-// 杀掉潜在残留的 Chrome 进程
+// 杀掉残留的 Chrome 进程
 function cleanOldChrome() {
   try {
     execSync('pkill -9 -f chrome || true');
@@ -76,28 +78,31 @@ function ensureChromeInstalled() {
 // 1. Web 状态与探活接口
 app.get('/', (req, res) => {
   res.json({
-    status: browser && page ? 'running' : (isStarting ? 'starting' : 'recovering'),
+    status: browser && page && !page.isClosed() ? 'running' : (isStarting ? 'starting' : 'recovering'),
     platform: 'anynines PaaS (Cloud Foundry)',
     service: 'a9s-afk-service',
-    version: '1.2.1',
+    version: '1.2.2',
     uptime: `${Math.floor(process.uptime())}s`,
     currentUser: ZENIX_EMAIL,
     pageTitle,
     pageUrl,
     currentSession: currentSessionCookie ? `${currentSessionCookie.substring(0, 8)}...` : 'None',
     lastLoginTime,
+    lastActivityAgo: `${Math.floor((Date.now() - lastActivityTime) / 1000)}s`,
     stats,
     viewLiveScreenshot: '/screenshot',
-    forceLoginNow: '/login-now',
+    forceRestart: '/restart',
     timestamp: new Date().toISOString()
   });
 });
 
-// 2. 实时画面截图预览
+// 2. 实时画面截图预览（带 5 秒超时保护）
 app.get('/screenshot', async (req, res) => {
   try {
     if (page && !page.isClosed()) {
-      const buffer = await page.screenshot({ type: 'png' });
+      const screenshotPromise = page.screenshot({ type: 'png' });
+      const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('Screenshot timeout')), 5000));
+      const buffer = await Promise.race([screenshotPromise, timeoutPromise]);
       res.set('Content-Type', 'image/png');
       return res.send(buffer);
     }
@@ -107,12 +112,12 @@ app.get('/screenshot', async (req, res) => {
   }
 });
 
-// 3. 手动触发重新登录
-app.get('/login-now', async (req, res) => {
+// 3. 手动触发强制重启
+app.get('/restart', async (req, res) => {
   try {
-    log('Manual login requested via /login-now');
-    const ok = await performDirectLoginAndInject();
-    return res.json({ status: ok ? 'success' : 'failed', currentSession: currentSessionCookie ? `${currentSessionCookie.substring(0, 8)}...` : 'None', pageUrl: page ? page.url() : 'null' });
+    log('Manual restart requested via /restart');
+    triggerBrowserRestart('Manual restart via API');
+    return res.json({ status: 'success', message: 'Restart triggered' });
   } catch (err) {
     res.status(500).json({ status: 'error', message: err.message });
   }
@@ -126,9 +131,9 @@ app.listen(PORT, () => {
   log(`Web server listening on port ${PORT}`);
 });
 
-// 4. 通过 Next.js Server Action 秒级执行登录并提取 Session
-async function performDirectLoginAndInject() {
-  log(`🔑 Initiating direct login for ${ZENIX_EMAIL}...`);
+// 4. 通过 Next.js Server Action 登录并获取最新 Session
+async function performDirectLogin() {
+  log(`🔑 Authenticating for ${ZENIX_EMAIL}...`);
   
   for (const pwd of PASSWORDS) {
     try {
@@ -153,40 +158,21 @@ async function performDirectLoginAndInject() {
           currentSessionCookie = match[1];
           lastLoginTime = new Date().toISOString();
           stats.loginCount++;
-          log(`🎉 Login successful! New session captured: ${currentSessionCookie.substring(0, 10)}... (Login #${stats.loginCount})`);
-
-          // 注入到 Puppeteer 页面中并打开 AFK
-          if (page && !page.isClosed()) {
-            await page.setCookie({
-              name: 'session',
-              value: currentSessionCookie,
-              domain: '.zenix.sg',
-              path: '/'
-            });
-            log('Navigating page to /dashboard/afk with refreshed session...');
-            await page.goto('https://dash.zenix.sg/dashboard/afk', {
-              waitUntil: 'domcontentloaded',
-              timeout: 45000
-            });
-            pageTitle = await page.title();
-            pageUrl = page.url();
-            log(`✅ AFK page ready! Title: "${pageTitle}" | URL: ${pageUrl}`);
-          }
-          return true;
+          lastActivityTime = Date.now();
+          log(`🎉 Login successful! Session captured: ${currentSessionCookie.substring(0, 10)}... (Login #${stats.loginCount})`);
+          return currentSessionCookie;
         }
-      } else {
-        log(`Password trial failed (${pwd.substring(0, 3)}***): ${bodyText.substring(0, 100)}`);
       }
     } catch (e) {
       log(`Login attempt error: ${e.message}`);
     }
   }
 
-  log('❌ All password candidates failed to authenticate.');
-  return false;
+  log('❌ Authentication failed for all credentials in pool.');
+  return null;
 }
 
-// 5. 启动无头浏览器并挂机
+// 5. 启动无头浏览器并进入挂机
 async function startBrowser() {
   if (isStarting) return;
   isStarting = true;
@@ -195,7 +181,10 @@ async function startBrowser() {
     cleanOldChrome();
     ensureChromeInstalled();
 
-    log('Launching Robust Headless Chrome via Puppeteer (pipe mode)...');
+    // 1. 登录并获取 Session
+    const sessionVal = await performDirectLogin();
+
+    log('Launching Headless Chrome via Puppeteer (pipe mode)...');
     browser = await puppeteer.launch({
       headless: 'new',
       pipe: true,
@@ -219,14 +208,12 @@ async function startBrowser() {
     page = await browser.newPage();
     await page.setUserAgent(USER_AGENT);
 
-    // 注入页面防休眠 / 防切后台 / 广告探测穿透机制
+    // 2. 注入页面防休眠与广告探测直通机制
     await page.evaluateOnNewDocument(() => {
-      // 1. 防休眠与活跃状态伪装
       Object.defineProperty(document, 'hidden', { get: () => false });
       Object.defineProperty(document, 'visibilityState', { get: () => 'visible' });
       window.addEventListener('visibilitychange', (e) => e.stopImmediatePropagation(), true);
 
-      // 2. 绕过广告探测 DOM 测量（确保 ad-probe 判定为存在并渲染）
       const origGetComputedStyle = window.getComputedStyle;
       window.getComputedStyle = function (el, pseudo) {
         const style = origGetComputedStyle.call(window, el, pseudo);
@@ -259,7 +246,18 @@ async function startBrowser() {
       });
     });
 
-    // 监听网络请求和响应
+    // 3. 注入 Session Cookie
+    if (sessionVal) {
+      await page.setCookie({
+        name: 'session',
+        value: sessionVal,
+        domain: '.zenix.sg',
+        path: '/'
+      });
+      log('Injected session cookie into browser.');
+    }
+
+    // 4. 监听网络事件
     page.on('response', async (response) => {
       const url = response.url();
       const status = response.status();
@@ -267,113 +265,151 @@ async function startBrowser() {
       if (url.includes('/api/ads/probe')) {
         stats.probeCount++;
         stats.lastEventTime = new Date().toISOString();
+        lastActivityTime = Date.now();
         log(`📡 [Probe] 探针心跳 #${stats.probeCount} (HTTP ${status})`);
-      } else if (url.includes('/afk') || url.includes('tickAfkCoinAction')) {
+      } else if (url.includes('/afk') || url.includes('tickAfkCoinAction') || url.includes('startAfkAction')) {
         stats.afkCount++;
         stats.lastEventTime = new Date().toISOString();
+        lastActivityTime = Date.now();
         try {
           const body = await response.text();
-          log(`💰 [AFK 结算] 触发金币结算 #${stats.afkCount} (HTTP ${status}): ${body.substring(0, 120)}`);
+          log(`💰 [AFK 结算] 触发心跳 #${stats.afkCount} (HTTP ${status}): ${body.substring(0, 100)}`);
         } catch (e) {
-          log(`💰 [AFK 结算] 触发金币结算 #${stats.afkCount} (HTTP ${status})`);
+          log(`💰 [AFK 结算] 触发心跳 #${stats.afkCount} (HTTP ${status})`);
         }
       } else if (url.includes('/balance')) {
         stats.balanceCount++;
+        lastActivityTime = Date.now();
         try {
           const body = await response.text();
-          log(`💳 [Balance] 刷新余额 #${stats.balanceCount} (HTTP ${status}): ${body.substring(0, 100)}`);
           const match = body.match(/"coins":\s*([0-9.]+)/);
           if (match) {
             stats.currentCoins = parseFloat(match[1]);
           }
+          log(`💳 [Balance] 刷新余额 #${stats.balanceCount} (HTTP ${status}): coins=${stats.currentCoins}`);
         } catch (e) {
           log(`💳 [Balance] 刷新余额 #${stats.balanceCount} (HTTP ${status})`);
         }
       }
     });
 
-    page.on('console', (msg) => {
-      const text = msg.text();
-      if (text.toLowerCase().includes('coin') || text.toLowerCase().includes('afk') || text.toLowerCase().includes('reward') || text.toLowerCase().includes('session')) {
-        log(`[Page Console] ${text}`);
-      }
+    log('Navigating to https://dash.zenix.sg/dashboard/afk ...');
+    await page.goto('https://dash.zenix.sg/dashboard/afk', {
+      waitUntil: 'domcontentloaded',
+      timeout: 45000
     });
 
-    // 启动即直接执行全自动秒级登录并跳转挂机
-    await performDirectLoginAndInject();
+    pageTitle = await page.title();
+    pageUrl = page.url();
+    log(`✅ Page loaded! Title: "${pageTitle}" | URL: ${pageUrl}`);
 
     isStarting = false;
 
-    // 监听浏览器异常断开，自愈重连
+    // 监听浏览器异常断开
     browser.on('disconnected', () => {
-      log('⚠️ Browser disconnected, auto restarting in 5s...');
-      browser = null;
-      page = null;
-      isStarting = false;
-      setTimeout(startBrowser, 5000);
+      log('⚠️ Browser disconnected event received.');
+      triggerBrowserRestart('Browser disconnected');
     });
-
-    // 启动常驻巡检守护循环（每 20 秒一次）
-    startGuardianLoop();
 
   } catch (err) {
     log(`❌ Browser error: ${err.message}`);
     isStarting = false;
-    if (browser) {
-      try { await browser.close(); } catch (e) { }
-      browser = null;
-      page = null;
-    }
-    setTimeout(startBrowser, 10000);
+    triggerBrowserRestart(`Launch error: ${err.message}`);
   }
 }
 
-// 6. 常驻巡检守护循环（自动点击恢复按钮、检测会话失效、防卡死）
-function startGuardianLoop() {
+// 6. 统一重启管理器（防抖重启）
+let restartTimer = null;
+function triggerBrowserRestart(reason) {
+  if (restartTimer) return;
+  log(`🔄 Scheduling browser restart. Reason: ${reason}`);
+  stats.restartCount++;
+  
+  restartTimer = setTimeout(async () => {
+    restartTimer = null;
+    isStarting = false;
+    if (page) {
+      try { await page.close(); } catch (e) {}
+      page = null;
+    }
+    if (browser) {
+      try { await browser.close(); } catch (e) {}
+      browser = null;
+    }
+    cleanOldChrome();
+    log('♻️ Executing fresh browser startup...');
+    startBrowser();
+  }, 4000);
+}
+
+// 7. 高鲁棒看门狗（Watchdog）：每 30 秒探测一次，杜绝假死与卡顿
+function startWatchdog() {
   setInterval(async () => {
     try {
-      if (!page || page.isClosed()) return;
+      if (isStarting) return;
 
-      pageTitle = await page.title();
-      pageUrl = page.url();
+      // 1. 如果浏览器或页面不存在，触发重启
+      if (!browser || !page || page.isClosed()) {
+        triggerBrowserRestart('Browser or page is null/closed');
+        return;
+      }
 
-      // 1. 如果掉到登录页或 Session 丢失，自动重新登录
+      // 2. 页面健康探测（如果 5 秒内无法获取 title，说明渲染线程假死卡住）
+      try {
+        const titlePromise = page.title();
+        const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('CDP title timeout')), 6000));
+        pageTitle = await Promise.race([titlePromise, timeoutPromise]);
+        pageUrl = page.url();
+      } catch (e) {
+        log(`🚨 [Watchdog Alert] Browser renderer is hanging (${e.message}), killing & restarting...`);
+        triggerBrowserRestart('Renderer hanging');
+        return;
+      }
+
+      // 3. 检查是否重定向到登录页
       if (pageUrl.includes('/login')) {
-        log('⚠️ Session expired (page on /login). Performing auto-login...');
-        await performDirectLoginAndInject();
+        log('⚠️ Page is on /login, session expired. Triggering restart & re-auth...');
+        triggerBrowserRestart('Landed on login page');
         return;
       }
 
-      // 2. 如果不在 AFK 页面，自动跳转回去
-      if (!pageUrl.includes('/dashboard/afk')) {
-        log(`⚠️ Not on AFK page (currently ${pageUrl}), redirecting to /dashboard/afk...`);
-        await page.goto('https://dash.zenix.sg/dashboard/afk', { waitUntil: 'domcontentloaded', timeout: 30000 });
-        return;
-      }
-
-      // 3. 自动查找并点击页面上的 "Continue"、"Start"、"Check Again"、"Retry" 按钮
-      const clicked = await page.evaluate(() => {
-        let actionDone = false;
-        const buttons = Array.from(document.querySelectorAll('button'));
-        for (const btn of buttons) {
-          const text = (btn.innerText || '').trim().toLowerCase();
-          if (text.includes('continue') || text.includes('check again') || text.includes('resume') || text.includes('retry') || text.includes('start')) {
-            btn.click();
-            actionDone = true;
+      // 4. 精准恢复：仅在存在“Session Paused”卡片时，精准点击卡片内的 Continue 按钮（绝不全局瞎点）
+      try {
+        const resumeClicked = await page.evaluate(() => {
+          const pausedCards = Array.from(document.querySelectorAll('.ops-card'));
+          for (const card of pausedCards) {
+            if (card.innerText && card.innerText.includes('Session Paused')) {
+              const btn = card.querySelector('button');
+              if (btn) {
+                btn.click();
+                return true;
+              }
+            }
           }
+          return false;
+        });
+        if (resumeClicked) {
+          log('🔘 Precision-clicked Continue on Session Paused card.');
         }
-        return actionDone;
-      });
-
-      if (clicked) {
-        log('🔘 Auto-clicked resume/continue/retry button on page.');
+      } catch (e) {
+        // ignore evaluate error
       }
 
-    } catch (e) {
-      log(`[Guardian Note] ${e.message}`);
+      // 5. 活跃超时检测：如果超过 3.5 分钟没有收到任何网络心跳事件，说明挂机静默中断，自动重启自愈
+      const inactiveSec = Math.floor((Date.now() - lastActivityTime) / 1000);
+      if (inactiveSec > 210) {
+        log(`🚨 [Watchdog Alert] No activity for ${inactiveSec}s (exceeded 210s threshold), auto healing...`);
+        triggerBrowserRestart(`Inactivity timeout (${inactiveSec}s)`);
+      }
+
+    } catch (err) {
+      log(`[Watchdog Error] ${err.message}`);
     }
-  }, 20 * 1000);
+  }, 30 * 1000);
 }
 
 // 延迟 2 秒启动
-setTimeout(startBrowser, 2000);
+setTimeout(() => {
+  startBrowser();
+  startWatchdog();
+}, 2000);
